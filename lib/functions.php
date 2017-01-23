@@ -9,11 +9,6 @@ function generateId(int $length = 32): string
 
 function parse(): \Generator
 {
-    static $HEADER_REGEX = "(
-        ([^()<>@,;:\\\"/[\]?={}\x01-\x20\x7F]+):
-        ([^\x01-\x08\x0A-\x1F\x7F]*)[\r]?[\n]
-    )x";
-
     start: {
         $data = "";
         $command = null;
