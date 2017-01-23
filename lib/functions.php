@@ -52,7 +52,7 @@ function parse(): \Generator
         if ($headerEndPosition === false) {
             goto windows_headers;
         }
-        $rawHeaders = \substr($data, 0, $headerEndPosition + 1);
+        $rawHeaders = \trim(\substr($data, 0, $headerEndPosition));
         $data = \substr($data, $headerEndPosition + 2);
         goto parse_headers;
     }
@@ -62,27 +62,23 @@ function parse(): \Generator
         if ($headerEndPosition === false) {
             goto recv_headers;
         }
-        $rawHeaders = \substr($data, 0, $headerEndPosition - 2);
+        $rawHeaders = \trim(\substr($data, 0, $headerEndPosition));
         $data = \substr($data, $headerEndPosition + 4);
         goto parse_headers;
     }
 
     parse_headers: {
-        if (!\preg_match_all($HEADER_REGEX, $rawHeaders, $matches)) {
-            throw new StompException(
-                "Invalid header syntax"
-            );
-        }
-
-        list(, $fields, $values) = $matches;
-        // Only the first occurrence of a header value matters in STOMP,
-        // so reverse the order ...
         $headers = [];
-        for ($i = \count($fields)-1; $i >= 0; $i--) {
-            // normalize field names to lowercase
-            $headers[\strtolower($fields[$i])] = $values[$i];
+        $headerLines = \preg_split("/[\r?\n]+/", $rawHeaders);
+        foreach ($headerLines as $headerLine) {
+            $headerDetails = \explode(':', $headerLine, 2);
+            $field = $headerDetails[0];
+            $value = $headerDetails[1] ?? "";
+            // Only the first occurrence of a header matters in STOMP
+            if (!isset($headers[$field])) {
+                $headers[$field] = $value;
+            }
         }
-        $headers = \array_reverse($headers);
 
         if (isset($headers["content-length"])) {
             $contentLength = (int) $headers["content-length"];
