@@ -5,6 +5,8 @@
 ![Stable v1](https://img.shields.io/badge/unstable-dev-red.svg?style=flat-square)
 ![License](https://img.shields.io/badge/license-MIT-blue.svg?style=flat-square)
 
+## THIS REPO IS A WORK-IN-PROGRESS ... DON'T USE IT FOR ANYTHING YET
+
 `amphp/stomp` is a non-blocking STOMP client built on the amp concurrency framework
 
 **Required PHP Version**
