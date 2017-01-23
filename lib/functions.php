@@ -62,7 +62,7 @@ function parse(): \Generator
         if ($headerEndPosition === false) {
             goto recv_headers;
         }
-        $rawHeaders = \substr($data, 0, $headerEndPos - 2);
+        $rawHeaders = \substr($data, 0, $headerEndPosition - 2);
         $data = \substr($data, $headerEndPosition + 4);
         goto parse_headers;
     }
