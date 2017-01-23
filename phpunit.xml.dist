@@ -22,7 +22,4 @@
             <directory suffix=".php">lib</directory>
         </whitelist>
     </filter>
-    <logging>
-        <log type="coverage-html" target="build/coverage" title="amp-stomp" highlight="true"/>
-    </logging>
 </phpunit>
