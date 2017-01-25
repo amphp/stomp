@@ -219,13 +219,8 @@ class Client
 
     private function determineNegotiatedVersion(string $versionHeader): int
     {
-        switch ($versionHeader) {
-            case Version::STRINGS[Version::V_1_0]:
-                return Version::V_1_0;
-            case Version::STRINGS[Version::V_1_1]:
-                return Version::V_1_1;
-            case Version::STRINGS[Version::V_1_2]:
-                return Version::V_1_2;
+        if ($version = \array_search($versionHeader, Version::STRINGS)) {
+            return $version;
         }
 
         throw new StompException(
