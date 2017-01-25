@@ -123,6 +123,7 @@ class Client
 
         $connectionPromise = resolve($this->doConnect());
         $connectionPromise->when(function ($e) {
+            $this->connectionPromise = null;
             if ($e) {
                 $this->cleanup();
             }
@@ -167,8 +168,6 @@ class Client
         if (isset($headers["heart-beat"])) {
             $this->initializeHeartbeat($headers["heart-beat"]);
         }
-
-        $this->connectionPromise = null;
     }
 
     private function buildConnectCommand(): string
