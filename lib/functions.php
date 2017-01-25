@@ -4,6 +4,8 @@ namespace Amp\Stomp;
 
 function generateId(int $length = 32): string
 {
+    // @TODO remove this once lib is more mature.
+    // For now it makes reading output in the console easier.
     return \bin2hex(\random_bytes($length));
 }
 
