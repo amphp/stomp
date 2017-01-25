@@ -679,4 +679,20 @@ class Client
 
         return resolve($this->sendFrame($frame));
     }
+
+    public function __debugInfo()
+    {
+        return [
+            "uri" => $this->uri,
+            "stream" => (string) $this->stream,
+            "writeWatcher" => $this->writeWatcher,
+            "readWatcher" => $this->readWatcher,
+            "writeQueueSize" => \count($this->writeQueue),
+            "writeBufferSize" => \strlen($this->writeBuffer),
+            "readResultQueueSize" => \count($this->readResultQueue),
+            "framesAwaitingReceipt" => \count($this->receiptsInWaiting),
+            "lastDataSentAt" => $this->lastDataSentAt,
+            "versionInUse" => Version::STRINGS[$this->versionInUse],
+        ];
+    }
 }
