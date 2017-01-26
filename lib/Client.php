@@ -2,19 +2,13 @@
 
 namespace Amp\Stomp;
 
-use Amp\Promise;
+use AsyncInterop\Loop;
+use AsyncInterop\Promise;
+
 use Amp\Success;
 use Amp\Failure;
 use Amp\Deferred;
-
-use function Amp\resolve;
-use function Amp\cancel;
-use function Amp\enable;
-use function Amp\disable;
-use function Amp\immediately;
-use function Amp\repeat;
-use function Amp\onReadable;
-use function Amp\onWritable;
+use Amp\Coroutine;
 
 class Client
 {
@@ -121,7 +115,7 @@ class Client
             return $this->connectionPromise;
         }
 
-        $connectionPromise = resolve($this->doConnect());
+        $connectionPromise = new Coroutine($this->doConnect());
         $connectionPromise->when(function ($e) {
             $this->connectionPromise = null;
             if ($e) {
@@ -136,11 +130,11 @@ class Client
     {
         $this->parser = parse();
         $this->stream = yield \Amp\Socket\connect($this->uri);
-        $this->writeWatcher = onWritable($this->stream, function () {
+        $this->writeWatcher = Loop::onWritable($this->stream, function () {
             $this->doStreamWrite();
         });
-        \Amp\disable($this->writeWatcher);
-        $this->readWatcher = onReadable($this->stream, function () {
+        Loop::disable($this->writeWatcher);
+        $this->readWatcher = Loop::onReadable($this->stream, function () {
             $this->consume();
         });
 
@@ -239,9 +233,9 @@ class Client
 
         $localMax = $this->options[self::OPTIONS["heart_beat_max"]];
         $max = ($remoteMax > $localMax) ? $remoteMax : $localMax;
-        $this->heartbeatWatcher = repeat(function () use ($max) {
+        $this->heartbeatWatcher = Loop::repeat(1000, function () use ($max) {
             $this->doHeartbeat($max); 
-        }, 1000);
+        });
     }
 
     private function doHeartbeat(int $interval)
@@ -287,13 +281,13 @@ class Client
     private function cleanup()
     {
         if (isset($this->writeWatcher)) {
-            \Amp\cancel($this->writeWatcher);
+            Loop::cancel($this->writeWatcher);
         }
         if (isset($this->readWatcher)) {
-            \Amp\cancel($this->readWatcher);
+            Loop::cancel($this->readWatcher);
         }
         if (isset($this->heartbeatWatcher)) {
-            \Amp\cancel($this->heartbeatWatcher);
+            Loop::cancel($this->heartbeatWatcher);
         }
 
         $this->writeWatcher = null;
@@ -373,7 +367,7 @@ class Client
             $this->onEmptyWrite();
         } elseif (isset($this->writeBuffer[$bytesWritten])) {
             $this->writeBuffer = \substr($this->writeBuffer, $bytesWritten);
-            enable($this->writeWatcher);
+            Loop::enable($this->writeWatcher);
         } else {
             $this->lastDataSentAt = \microtime(true);
             $this->onCompleteWrite();
@@ -394,15 +388,15 @@ class Client
     {
         // Allow empty deferreds so it's possible to insert heart-beat sends
         if ($oldDeferred = $this->writeDeferred) {
-            immediately([$oldDeferred, "succeed"]);
+            Loop::defer([$oldDeferred, "resolve"]);
         }
         if ($this->writeQueue) {
             list($this->writeBuffer, $this->writeDeferred) = \array_shift($this->writeQueue);
-            enable($this->writeWatcher);
+            Loop::enable($this->writeWatcher);
         } else {
             $this->writeDeferred = null;
             $this->writeBuffer = "";
-            disable($this->writeWatcher);
+            Loop::disable($this->writeWatcher);
         }
     }
 
@@ -452,7 +446,7 @@ class Client
 
         if ($deferred = $this->readDeferred) {
             $this->readDeferred = null;
-            $deferred->succeed($frame);
+            $deferred->resolve($frame);
             return;
         }
 
@@ -477,9 +471,9 @@ class Client
                 break;
             }
         }
-        immediately(static function () use ($toSucceed) {
+        Loop::defer(static function () use ($toSucceed) {
             foreach ($toSucceed as $deferred) {
-                $deferred->succeed();
+                $deferred->resolve();
             }
         });
     }
@@ -491,7 +485,7 @@ class Client
             "ERROR frame received:\n\n{$frame}"
         );
 
-        immediately(function () use ($e) {
+        Loop::defer(function () use ($e) {
             $this->failOutstandingPromises($e);
         });
     }
@@ -533,7 +527,7 @@ class Client
         $body = $data;
         $frame = new Frame($command, $headers, $body);
 
-        return resolve($this->sendFrame($frame));
+        return new Coroutine($this->sendFrame($frame));
     }
 
     /**
@@ -541,7 +535,7 @@ class Client
      */
     public function subscribe(string $destination, array $headers = []): Promise
     {
-        return resolve($this->doSubscribe($destination, $headers));
+        return new Coroutine($this->doSubscribe($destination, $headers));
     }
 
     private function doSubscribe(string $destination, array $headers): \Generator
@@ -581,12 +575,12 @@ class Client
         $headers["id"] = $headers["id"] ?? $subscriptionId;
         $frame = new Frame($command, $headers, $body = "");
 
-        return resolve($this->sendFrame($frame));
+        return new Coroutine($this->sendFrame($frame));
     }
 
     public function begin(string $transactionId = null, array $headers = []): Promise
     {
-        return resolve($this->doBegin($transactionId, $headers));
+        return new Coroutine($this->doBegin($transactionId, $headers));
     }
 
     private function doBegin(string $transactionId = null, array $headers = []): \Generator
@@ -607,7 +601,7 @@ class Client
         $headers["transaction"] = $headers["transaction"] ?? $transactionId;
         $frame = new Frame($command, $headers, $body = "");
 
-        return resolve($this->sendFrame($frame));
+        return new Coroutine($this->sendFrame($frame));
     }
 
     public function abort(string $transactionId, array $headers = []): Promise
@@ -616,7 +610,7 @@ class Client
         $headers["transaction"] = $headers["transaction"] ?? $transactionId;
         $frame = new Frame($command, $headers, $body = "");
 
-        return resolve($this->sendFrame($frame));
+        return new Coroutine($this->sendFrame($frame));
     }
 
     public function ack(string $messageId, string $transactionId = null, array $headers = []): Promise
@@ -639,7 +633,7 @@ class Client
 
         $frame = new Frame($command, $headers, $body = "");
 
-        return resolve($this->sendFrame($frame));
+        return new Coroutine($this->sendFrame($frame));
     }
 
     public function nack(string $messageId, string $transactionId = null, array $headers = []): Promise
@@ -668,7 +662,7 @@ class Client
 
         $frame = new Frame($command, $headers, $body = "");
 
-        return resolve($this->sendFrame($frame));
+        return new Coroutine($this->sendFrame($frame));
     }
 
     public function disconnect(array $headers = []): Promise
@@ -676,7 +670,7 @@ class Client
         $command = Command::DISCONNECT;
         $frame = new Frame($command, $headers, $body = "");
 
-        return resolve($this->sendFrame($frame));
+        return new Coroutine($this->sendFrame($frame));
     }
 
     public function __debugInfo()
