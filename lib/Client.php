@@ -9,22 +9,23 @@ use Amp\Success;
 use Amp\Failure;
 use Amp\Deferred;
 use Amp\Coroutine;
+use Amp\Emitter;
+use Amp\Stream;
 
 class Client
 {
     const OPTIONS = [
         "default_content_type"  => 0,
         "require_receipt"       => 1,
-        "max_queued_writes"     => 2,
-        "force_connect_frame"   => 3,
-        "vhost"                 => 4,
-        "login"                 => 5,
-        "passcode"              => 6,
-        "accept_version"        => 7,
-        "heart_beat_enable"     => 8,
-        "heart_beat_min"        => 9,
-        "heart_beat_max"        => 10,
-        "universal_headers"     => 11,
+        "force_connect_frame"   => 2,
+        "vhost"                 => 3,
+        "login"                 => 4,
+        "passcode"              => 5,
+        "accept_version"        => 6,
+        "heart_beat_enable"     => 7,
+        "heart_beat_min"        => 8,
+        "heart_beat_max"        => 9,
+        "universal_headers"     => 10,
     ];
 
     const ALLOWED_ACKS = [
@@ -36,26 +37,20 @@ class Client
     const DEFAULT_PORT = "61613";
 
     private $uri;
-    private $parser;
-    private $stream;
-    private $readWatcher;
-    private $writeWatcher;
-    private $writeQueue = [];
-    private $writeBuffer = "";
-    private $writeDeferred;
-    private $readDeferred;
-    private $readResultQueue = [];
+    private $socket;
+    private $frameStream;
     private $receiptsInWaiting = [];
     private $connectionPromise;
     private $filter;
     private $heartbeatWatcher;
     private $lastDataSentAt;
     private $versionInUse;
+    private $subscriptionIdToEmitterMap = [];
+    private $streamIdToSubscriptionIdMap;
 
     private $options = [
         self::OPTIONS["default_content_type"]   => "text/plain",
         self::OPTIONS["require_receipt"]        => false,
-        self::OPTIONS["max_queued_writes"]      => 2048,
         self::OPTIONS["force_connect_frame"]    => false,
         self::OPTIONS["vhost"]                  => "/",
         self::OPTIONS["login"]                  => null,
@@ -88,6 +83,7 @@ class Client
 
         $this->setOptions($options);
         $this->filter = $filter ?? new NullFilter;
+        $this->streamIdToSubscriptionIdMap = new \SplObjectStorage;
     }
 
     private function setOptions(array $options)
@@ -98,45 +94,39 @@ class Client
         }
     }
 
-    private function isConnected(): bool
-    {
-        return $this->stream && \is_resource($this->stream) && !\feof($this->stream);
-    }
-
     /**
      * @return Promise<null>
      */
     public function connect(): Promise
     {
-        if ($this->stream) {
+        if ($this->socket) {
             return new Success;
         }
         if ($this->connectionPromise) {
             return $this->connectionPromise;
         }
 
+        $deferred = new Deferred;
         $connectionPromise = new Coroutine($this->doConnect());
-        $connectionPromise->when(function ($e) {
+        $connectionPromise->when(function ($e) use ($deferred) {
             $this->connectionPromise = null;
             if ($e) {
-                $this->cleanup();
+                $this->end();
+                $deferred->fail($e);
+            } else {
+                $deferred->resolve();
             }
         });
 
-        return $this->connectionPromise = $connectionPromise;
+        $this->connectionPromise = $connectionPromise;
+
+        return $deferred->promise();
     }
 
     private function doConnect(): \Generator
     {
-        $this->parser = parse();
-        $this->stream = yield \Amp\Socket\connect($this->uri);
-        $this->writeWatcher = Loop::onWritable($this->stream, function () {
-            $this->doStreamWrite();
-        });
-        Loop::disable($this->writeWatcher);
-        $this->readWatcher = Loop::onReadable($this->stream, function () {
-            $this->consume();
-        });
+        $this->socket = $socket = yield \Amp\Socket\connect($this->uri);
+        $this->frameStream = new FrameStream($socket);
 
         $command = $this->buildConnectCommand();
         $headers = $this->buildConnectHeaders();
@@ -144,8 +134,9 @@ class Client
 
         yield from $this->sendFrame($frame);
 
-        $frame = yield $this->read();
-        
+        yield $this->frameStream->advance();
+        $frame = $this->frameStream->getCurrent();
+
         list($command, $headers, $body) = $frame->list();
 
         if ($command !== Command::CONNECTED) {
@@ -162,6 +153,42 @@ class Client
         if (isset($headers["heart-beat"])) {
             $this->initializeHeartbeat($headers["heart-beat"]);
         }
+
+        // consume data off the frame stream now that we're all setup
+        new Coroutine($this->consume());
+    }
+
+    private function sendFrame(Frame $frame): \Generator
+    {
+        $frame = $this->filter->filter(Filter::WRITE, $frame);
+        list($command, $headers, $body) = $frame->list();
+
+        foreach ($this->options[self::OPTIONS["universal_headers"]] as $key => $value) {
+            if (!isset($headers[$key])) {
+                $headers[$key] = $value;
+            }
+        }
+
+        if ($command !== Command::CONNECT
+            && !isset($headers["receipt"])
+            && $this->options[Client::OPTIONS["require_receipt"]]
+        ) {
+            $headers["receipt"] = generateId();
+        }
+
+        $normalizedHeaders = $this->normalizeHeaders($headers);
+        $dataToWrite = "{$command}\n{$normalizedHeaders}\n{$body}\0";
+
+        yield $this->frameStream->send($dataToWrite);
+
+        if (!isset($normalizedHeaders["receipt"])) {
+            return;
+        }
+
+        $deferred = new Deferred;
+        $this->receiptsInWaiting[$normalizedHeaders["receipt"]] = $deferred;
+
+        yield $deferred->promise();
     }
 
     private function buildConnectCommand(): string
@@ -240,11 +267,6 @@ class Client
 
     private function doHeartbeat(int $interval)
     {
-        // if data is queued for write there's no point in sending a heartbeat
-        if ($this->writeQueue || isset($this->writeBuffer[0])) {
-            return;
-        }
-
         // if the heartbeat timout has yet to elapse we don't need to send
         $now = \microtime(true);
         $msSinceLastSend = (($now - $this->lastDataSentAt) * 1000);
@@ -252,77 +274,28 @@ class Client
             return;
         }
 
-        $this->writeBuffer = "\n";
-        $this->writeDeferred = null;
-        $this->doStreamWrite();
+        $this->frameStream->send("\n");
     }
 
-    private function sendFrame(Frame $frame): \Generator
+    private function end(\Throwable $e = null)
     {
-        $frame = $this->filter->filter(Filter::WRITE, $frame);
-        list($command, $headers, $body) = $frame->list();
-
-        foreach ($this->options[self::OPTIONS["universal_headers"]] as $key => $value) {
-            if (!isset($headers[$key])) {
-                $headers[$key] = $value;
-            }
-        }
-
-        if ($command !== Command::CONNECT
-            && !isset($headers["receipt"])
-            && $this->options[Client::OPTIONS["require_receipt"]]
-        ) {
-            $headers["receipt"] = generateId();
-        }
-
-        yield from $this->doWrite($command, $headers, $body);
-    }
-
-    private function cleanup()
-    {
-        if (isset($this->writeWatcher)) {
-            Loop::cancel($this->writeWatcher);
-        }
-        if (isset($this->readWatcher)) {
-            Loop::cancel($this->readWatcher);
-        }
         if (isset($this->heartbeatWatcher)) {
             Loop::cancel($this->heartbeatWatcher);
         }
 
-        $this->writeWatcher = null;
-        $this->readWatcher = null;
+        if ($e) {
+            foreach ($this->subscriptionIdToEmitterMap as $emitter) {
+                $emitter->fail($e);
+            }
+        } else {
+            foreach ($this->subscriptionIdToEmitterMap as $emitter) {
+                $emitter->resolve();
+            }
+        }
+
+        $this->socket = null;
+        $this->frameStream = null;
         $this->heartbeatWatcher = null;
-        $this->stream = null;
-        $this->connectionPromise = null;
-
-        if ($this->readDeferred) {
-            $this->readDeferred->fail(new StompException("Connection gone"));
-        }
-    }
-
-    private function doWrite(string $command, array $headers, string $body): \Generator
-    {
-        yield $this->connect();
-
-        $maxQueuedWrites = $this->options[self::OPTIONS["max_queued_writes"]];
-        if (isset($this->writeQueue[$maxQueuedWrites - 1])) {
-            throw new StompException(
-                "Cannot write frame; max_queued_writes limit reached ({$maxQueuedWrites})"
-            );
-        }
-
-        $normalizedHeaders = $this->normalizeHeaders($headers);
-        $dataToWrite = "{$command}\n{$normalizedHeaders}\n{$body}\0";
-
-        yield $this->streamWrite($dataToWrite);
-
-        if (isset($normalizedHeaders["receipt"])) {
-            $deferred = new Deferred;
-            $this->receiptsInWaiting[$normalizedHeaders["receipt"]] = $deferred;
-
-            yield $deferred->promise();
-        }
     }
 
     private function normalizeHeaders(array $headers)
@@ -345,115 +318,34 @@ class Client
         ]);
     }
 
-    private function streamWrite(string $dataToWrite): Promise
-    {
-        $deferred = new Deferred;
-
-        if ($this->writeDeferred || isset($this->writeBuffer[0])) {
-            $this->writeQueue[] = [$dataToWrite, $deferred];
-        } else {
-            $this->writeBuffer = $dataToWrite;
-            $this->writeDeferred = $deferred;
-            $this->doStreamWrite();
-        }
-
-        return $deferred->promise();
-    }
-
-    private function doStreamWrite()
-    {
-        $bytesWritten = @\fwrite($this->stream, $this->writeBuffer);
-        if (empty($bytesWritten)) {
-            $this->onEmptyWrite();
-        } elseif (isset($this->writeBuffer[$bytesWritten])) {
-            $this->writeBuffer = \substr($this->writeBuffer, $bytesWritten);
-            Loop::enable($this->writeWatcher);
-        } else {
-            $this->lastDataSentAt = \microtime(true);
-            $this->onCompleteWrite();
-        }
-    }
-
-    private function onEmptyWrite()
-    {
-        if (!$this->isConnected()) {
-            $this->cleanup();
-            $this->writeDeferred->fail(new StompException(
-                "Connection went away :("
-            ));
-        }
-    }
-
-    private function onCompleteWrite()
-    {
-        // Allow empty deferreds so it's possible to insert heart-beat sends
-        if ($oldDeferred = $this->writeDeferred) {
-            Loop::defer([$oldDeferred, "resolve"]);
-        }
-        if ($this->writeQueue) {
-            list($this->writeBuffer, $this->writeDeferred) = \array_shift($this->writeQueue);
-            Loop::enable($this->writeWatcher);
-        } else {
-            $this->writeDeferred = null;
-            $this->writeBuffer = "";
-            Loop::disable($this->writeWatcher);
-        }
-    }
-
-    /**
-     * @return Promise<Frame>
-     */
-    public function read(): Promise
-    {
-        if ($this->readResultQueue) {
-            $frame = \array_shift($this->readResultQueue);
-            return new Success($frame);
-        }
-        if (empty($this->readDeferred)) {
-            $this->readDeferred = new Deferred;
-        }
-
-        return $this->readDeferred->promise();
-    }
-
     private function consume()
     {
-        $data = @\fread($this->stream, 8192);
-        $hasData = isset($data[0]);
-        if (!($hasData || $this->isConnected())) {
-            $this->cleanup();
-        }
-        if (!$hasData) {
-            return;
-        }
-        if (!$frame = $this->parser->send($data)) {
-            return;
-        }
+        while (yield $this->frameStream->advance()) {
+            $frame = $this->frameStream->getCurrent();
+            $frame = $this->filter->filter(Filter::READ, $frame);
 
-        $frame = $this->filter->filter(Filter::READ, $frame);
-
-        switch ($frame->getCommand()) {
-            case Command::CONNECTED:
-            case Command::MESSAGE:
-                break;
-            case Command::RECEIPT:
-                $this->onServerReceiptFrame($frame);
-                return;
-            case Command::ERROR:
-                $this->onServerErrorFrame($frame);
-                return;
+            switch ($frame->getCommand()) {
+                case Command::MESSAGE:
+                    $this->processMessage($frame);
+                    break;
+                case Command::RECEIPT:
+                    $this->processReceipt($frame);
+                    break;
+                case Command::ERROR:
+                    $this->end(new StompException(
+                        "ERROR frame received:\n\n{$frame}"
+                    ));
+                    break;
+                default:
+                    $this->end(new StompException(
+                        "Unknown frame type received:\n\n{$frame}"
+                    ));
+                    break;
+            }
         }
-
-        if ($deferred = $this->readDeferred) {
-            $this->readDeferred = null;
-            $deferred->resolve($frame);
-            return;
-        }
-
-        $this->readResultQueue[] = $frame;
     }
 
-    private function onServerReceiptFrame(Frame $frame)
+    private function processReceipt(Frame $frame)
     {
         $headers = $frame->getHeaders();
         if (!isset($headers["receipt-id"])) {
@@ -471,50 +363,27 @@ class Client
                 break;
             }
         }
-        Loop::defer(static function () use ($toSucceed) {
-            foreach ($toSucceed as $deferred) {
-                $deferred->resolve();
-            }
-        });
-    }
-
-    private function onServerErrorFrame(Frame $frame)
-    {
-        list($command, $headers, $body) = $frame->list();
-        $e = new StompException(
-            "ERROR frame received:\n\n{$frame}"
-        );
-
-        Loop::defer(function () use ($e) {
-            $this->failOutstandingPromises($e);
-        });
-    }
-
-    private function failOutstandingPromises(\Throwable $e)
-    {
-        if ($this->readDeferred) {
-            $this->readDeferred->fail($e);
-            $this->readDeferred = null;
+        foreach ($toSucceed as $deferred) {
+            $deferred->resolve();
         }
-        if (empty($this->receiptsInWaiting)) {
+    }
+
+    private function processMessage(Frame $frame)
+    {
+        $headers = $frame->getHeaders();
+        if (!isset($headers["subscription"])) {
+            // if there's no subscription ID in the headers we're done here
             return;
         }
-        $receiptError = new StompException(
-            $msg = "Error experienced while awaiting RECEIPT",
-            $code = 0,
-            $prev = $e
-        );
-        $receiptsToFail = $this->receiptsInWaiting;
-        $this->receiptsInWaiting = [];
-        foreach ($receiptsToFail as $deferred) {
-            $deferred->fail($receiptError);
-        }
+        $subscriptionId = $headers["subscription"];
+        $emitter = $this->subscriptionIdToEmitterMap[$subscriptionId];
+        $emitter->emit($frame);
     }
 
     /**
      *
      */
-    public function send(string $destination, string $data, array $headers = []): Promise
+    public function publish(string $destination, string $data, array $headers = []): Promise
     {
         $command = Command::SEND;
         $headers = \array_change_key_case($headers, \CASE_LOWER);
@@ -531,28 +400,39 @@ class Client
     }
 
     /**
-     * @return Promise<string> Resolves to subscription identifier string
+     * @return Promise<Stream>
      */
-    public function subscribe(string $destination, array $headers = []): Promise
+    public function subscribe(string $destination, array $headers = []): Stream
     {
-        return new Coroutine($this->doSubscribe($destination, $headers));
+        $emitter = new Emitter;
+        new Coroutine($this->establishSubscription($emitter, $destination, $headers));
+        $stream = $emitter->stream();
+        $streamId = \spl_object_hash($stream);
+        $stream->when(function () use ($streamId) {
+            unset($this->streamIdToSubscriptionIdMap[$streamId]);
+        });
+
+        return $stream;
     }
 
-    private function doSubscribe(string $destination, array $headers): \Generator
+    private function establishSubscription(Emitter $emitter, string $destination, array $headers)
     {
         $ack = $headers["ack"] ?? "auto";
         if (!isset(self::ALLOWED_ACKS[$ack])) {
-            throw new StompException(
+            $emitter->fail(new StompException(
                 "Invalid ack header value: {$ack}"
-            );
+            ));
+            return;
         }
+
         if ($this->versionInUse === Version::V_1_0 &&
             $ack === self::ALLOWED_ACKS["client-individual"]
         ) {
-            throw new StompException(
+            $emitter->fail(new StompException(
                 "STOMP v1.0 does not support the use of ack:client-individual ... " .
                 "Please use ack:auto or ack:client instead."
-            );
+            ));
+            return;
         }
 
         $command = Command::SUBSCRIBE;
@@ -561,21 +441,49 @@ class Client
         $headers["id"] = $headers["id"] ?? generateId();
 
         $frame = new Frame($command, $headers, $body = "");
-        yield from $this->sendFrame($frame);
 
-        return (string) $headers["id"];
+        try {
+            yield from $this->sendFrame($frame);
+        } catch (\Throwable $e) {
+            $emitter->fail(new StompException(
+                $msg = "Failed sending SUBSCRIBE frame to server",
+                $code = 0,
+                $previous = $e
+            ));
+            return;
+        }
+
+        $subscriptionId = $headers["id"];
+        $stream = $emitter->stream();
+        $this->streamIdToSubscriptionIdMap[$stream] = $subscriptionId;
+        $this->subscriptionIdToEmitterMap[$subscriptionId] = $emitter;
     }
 
     /**
      * @return Promise<null>
      */
-    public function unsubscribe(string $subscriptionId, array $headers = []): Promise
+    public function unsubscribe(Stream $stream, array $headers = []): Promise
     {
+        $streamId = \spl_object_hash($stream);
+        if (!isset($this->streamIdToSubscriptionIdMap[$streamId])) {
+            return new Success;
+        }
+
         $command = Command::UNSUBSCRIBE;
         $headers["id"] = $headers["id"] ?? $subscriptionId;
         $frame = new Frame($command, $headers, $body = "");
 
-        return new Coroutine($this->sendFrame($frame));
+        $promise = new Coroutine($this->sendFrame($frame));
+        $promise->when(function ($e, $r) use ($streamId) {
+            if (empty($e)) {
+                $subscriptionId = $this->streamIdToSubscriptionIdMap[$streamId];
+                $emitter = $this->subscriptionIdToEmitterMap[$subscriptionId];
+                unset($this->subscriptionIdToEmitterMap[$subscriptionId]);
+                $emitter->resolve();
+            }
+        });
+
+        return $promise;
     }
 
     public function begin(string $transactionId = null, array $headers = []): Promise
@@ -677,7 +585,7 @@ class Client
     {
         return [
             "uri" => $this->uri,
-            "stream" => (string) $this->stream,
+            "stream" => (string) $this->socket,
             "writeWatcher" => $this->writeWatcher,
             "readWatcher" => $this->readWatcher,
             "writeQueueSize" => \count($this->writeQueue),
