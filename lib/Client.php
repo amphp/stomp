@@ -2,9 +2,8 @@
 
 namespace Amp\Stomp;
 
-use AsyncInterop\Loop;
-use AsyncInterop\Promise;
-
+use Amp\Loop;
+use Amp\Promise;
 use Amp\Success;
 use Amp\Failure;
 use Amp\Deferred;

@@ -21,7 +21,6 @@
         "php": ">=7",
         "amphp/amp": "dev-master",
         "amphp/socket": "dev-amp_v2",
-        "amphp/loop": "dev-master",
         "amphp/stream": "dev-master as 0.1",
         "amphp/dns": "dev-amp_v2 as 0.2",
         "amphp/windows-registry": "dev-amp_v2 as 0.3",

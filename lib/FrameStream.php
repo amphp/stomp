@@ -2,11 +2,9 @@
 
 namespace Amp\Stomp;
 
-use AsyncInterop\Loop;
-use AsyncInterop\Promise;
-
+use Amp\Loop;
+use Amp\Promise;
 use Amp\Struct;
-use Amp\Success;
 use Amp\Iterator;
 use Amp\Emitter;
 use Amp\Listener;
